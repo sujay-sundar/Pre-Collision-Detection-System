@@ -64,12 +64,21 @@ OBSTRUCTION_FRAMES  = 45
 REENTRY_WINDOW      = 60
 
 # Plot colours (BGR)
-PLOT_BG   = (16, 18, 26)
-GRID_COL  = (32, 38, 52)
-COL_DIST  = (60,  200, 255)
-COL_SPEED = (100, 255, 140)
-COL_GR    = (255, 160, 60)
-COL_TTC   = (200, 80,  255)
+PLOT_BG    = (16, 18, 26)
+GRID_COL   = (32, 38, 52)
+COL_DIST   = (60,  200, 255)
+COL_SPEED  = (100, 255, 140)   # object speed
+COL_GR     = (255, 160, 60)
+COL_TTC    = (200, 80,  255)
+COL_VSPD   = (80,  120, 255)   # vehicle speed (IMU)
+COL_CLOSE  = (60,  230, 255)   # closing speed (fused)
+COL_FTCC   = (255, 80,  180)   # fused TTC
+
+# IMU simulation
+IMU_DT          = 0.033        # 30 Hz
+IMU_NOISE_ACCEL = 0.025        # g  — realistic MPU6050 noise
+IMU_NOISE_GYRO  = 0.30         # °/s
+IMU_BIAS_DRIFT  = 0.0003       # slow bias creep per sample
 
 # ── Alert level definitions ────────────────────────────────────────────────────
 #   Each level: (label, banner_bg_BGR, banner_fg_BGR, bar_colour, sound, gpio)
@@ -168,8 +177,167 @@ class KalmanDist:
         self.x = np.array([[d],[0.0]]); self.P = np.eye(2); self._t = None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARUCO DETECTOR
+# SIMULATED IMU  — realistic MPU6050 noise model
 # ══════════════════════════════════════════════════════════════════════════════
+class SimulatedIMU:
+    """
+    Produces ax readings that mimic a real MPU6050 on a low-speed vehicle.
+
+    Noise sources modelled:
+      • White Gaussian noise       — per-sample sensor noise
+      • Slow bias drift            — gyro/accel bias creep over time
+      • Vibration harmonics        — road surface at ~2–8 Hz
+      • Quantisation noise         — 16-bit ADC at ±2g → ~0.6mg LSB
+      • Occasional spike           — cable vibration / motor interference
+
+    Drive cycle (repeats every CYCLE seconds):
+      0–5s   : accelerate  ~0 → 2.8 m/s (≈10 km/h)
+      5–20s  : cruise      constant speed
+      20–25s : brake       2.8 → 0 m/s
+      25–30s : stationary
+    """
+    CYCLE = 30.0
+
+    def __init__(self):
+        self.t          = 0.0
+        self.true_speed = 0.0   # m/s ground truth
+        self.bias       = 0.0   # slowly drifting bias
+
+    def step(self):
+        """Advance one IMU sample. Returns raw ax in g."""
+        self.t += IMU_DT
+        tc = self.t % self.CYCLE
+
+        # True acceleration profile (m/s²)
+        if   tc < 5:         true_ax_ms2 =  0.56    # 0→10 km/h in 5s
+        elif tc < 20:        true_ax_ms2 =  0.0
+        elif tc < 25:        true_ax_ms2 = -0.56
+        else:                true_ax_ms2 =  0.0
+
+        self.true_speed = max(0.0, self.true_speed + true_ax_ms2 * IMU_DT)
+        true_ax_g = true_ax_ms2 / 9.81
+
+        # Bias drift (slow random walk)
+        self.bias += np.random.normal(0, IMU_BIAS_DRIFT)
+        self.bias  = np.clip(self.bias, -0.05, 0.05)
+
+        # Road vibration (2–8 Hz harmonics)
+        vib = (0.008 * np.sin(2 * np.pi * 3.1 * self.t) +
+               0.005 * np.sin(2 * np.pi * 6.7 * self.t) +
+               0.003 * np.sin(2 * np.pi * 8.2 * self.t))
+
+        # White noise
+        noise = np.random.normal(0, IMU_NOISE_ACCEL)
+
+        # Occasional spike (~1% of samples)
+        spike = np.random.choice([0.0, np.random.normal(0, 0.15)],
+                                  p=[0.99, 0.01])
+
+        # Quantisation (16-bit at ±2g → 1/32768 g per LSB)
+        quant = round((true_ax_g + self.bias + vib + noise + spike)
+                      * 32768) / 32768.0
+
+        return quant, self.true_speed
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VEHICLE VELOCITY ESTIMATOR  — integrates IMU ax with drift correction
+# ══════════════════════════════════════════════════════════════════════════════
+class VehicleVelocityEstimator:
+    """
+    Integrates calibrated forward acceleration to estimate vehicle speed.
+
+    Drift mitigations:
+      1. Low-pass filter on ax before integration
+      2. Zero-velocity clamp when |ax| < noise floor for N frames
+      3. Leaky integrator — gentle exponential decay
+      4. Non-negative clamp (forward-only vehicle)
+
+    On Pi: replace SimulatedIMU.step() with real MPU6050.get_data()
+    and feed ax from calibrated IMU.
+    """
+    NOISE_FLOOR  = 0.04    # g
+    STILL_FRAMES = 15
+    LEAK         = 0.998
+    LPF_ALPHA    = 0.20
+
+    def __init__(self):
+        self.v     = 0.0
+        self.lpf   = 0.0
+        self.still = 0
+
+    def update(self, ax_raw_g):
+        self.lpf = self.LPF_ALPHA * ax_raw_g + (1 - self.LPF_ALPHA) * self.lpf
+        if abs(self.lpf) < self.NOISE_FLOOR:
+            self.still += 1
+        else:
+            self.still = 0
+        if self.still >= self.STILL_FRAMES:
+            self.v = 0.0
+            return 0.0
+        self.v  = max(0.0, (self.v + self.lpf * 9.81 * IMU_DT) * self.LEAK)
+        return self.v   # m/s
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SENSOR FUSION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class FusionEngine:
+    """
+    Fuses camera-derived object approach speed with IMU-derived vehicle speed
+    to compute closing speed and fused TTC.
+
+    Closing speed = object_approach_speed + vehicle_forward_speed
+
+    Why this matters:
+      At 10 km/h vehicle speed + 5 km/h object approach speed:
+        Camera-only TTC  = dist / 1.4 m/s   (underestimates risk)
+        Fused TTC        = dist / 2.8 m/s   (correct)
+      → Camera-only gives 2× the time — could be the difference between
+        a warning and a collision.
+
+    IMU weight slider (0–100):
+      0   = camera TTC only (ignore IMU)
+      50  = equal blend
+      100 = full IMU contribution
+      Use lower values if vehicle speed is zero or IMU is uncalibrated.
+    """
+    def __init__(self):
+        self.closing_hist = deque(maxlen=DIST_HIST_LEN)
+        self.fttc_hist    = deque(maxlen=DIST_HIST_LEN)
+        self.vspd_hist    = deque(maxlen=DIST_HIST_LEN)
+
+    def compute(self, obj_spd_ms: float, veh_spd_ms: float,
+                dist_m: float, imu_weight: float) -> dict:
+        """
+        obj_spd_ms  : Kalman-filtered object approach speed (m/s, + = approaching)
+        veh_spd_ms  : IMU-estimated vehicle forward speed (m/s)
+        dist_m      : Kalman-filtered distance to object (m)
+        imu_weight  : 0.0–1.0 how much vehicle speed contributes
+
+        Returns dict with closing_speed, fused_ttc, contrib breakdown.
+        """
+        obj_contribution = max(0.0, obj_spd_ms)
+        veh_contribution = veh_spd_ms * imu_weight
+
+        closing_speed = obj_contribution + veh_contribution
+        closing_speed = max(0.0, closing_speed)
+
+        if closing_speed > 0.01 and dist_m:
+            fused_ttc = round(min(dist_m / closing_speed, 99.9), 1)
+        else:
+            fused_ttc = 99.9
+
+        self.closing_hist.append(closing_speed)
+        self.vspd_hist.append(veh_spd_ms)
+        self.fttc_hist.append(min(fused_ttc, 10.0))
+
+        return dict(
+            closing_speed   = closing_speed,
+            fused_ttc       = fused_ttc,
+            obj_contrib_ms  = obj_contribution,
+            veh_contrib_ms  = veh_contribution,
+        )
+
+
 class ArucoDetector:
     def __init__(self):
         d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
@@ -332,7 +500,7 @@ class AlertStateMachine:
         self.hold_frames = 0      # hold high alert when track lost briefly
         self.prev_level  = 0
 
-    def evaluate(self, tr: Tracker, ttc_w: float, ttc_c: float, min_spd: float) -> tuple:
+    def evaluate(self, tr: Tracker, ttc_w: float, ttc_c: float, min_spd: float, fused_ttc: float = None) -> tuple:
         if not tr.active:
             if self.hold_frames > 0 and self.level >= 3:
                 self.hold_frames -= 1
@@ -343,7 +511,7 @@ class AlertStateMachine:
             return self.level, self.edge_case
 
         gr  = tr.growth()
-        ttc = tr.ttc()
+        ttc = fused_ttc if (fused_ttc is not None and fused_ttc < 99.0) else tr.ttc()
         spd = max(0.0, tr.speed_f)
         self.hold_frames = HOLD_FRAMES    # reset hold whenever we have detection
         self.edge_case   = None
@@ -432,88 +600,200 @@ def sparkline(canvas, data, x0, y0, pw, ph, col,
         zy=int(y0+ph-1-(zero_line-vmin)/rng*(ph-2))
         cv2.line(canvas,(x0,np.clip(zy,y0,y0+ph)),(x0+pw,np.clip(zy,y0,y0+ph)),GRID_COL,1)
 
-def draw_panel(canvas, tr, level):
-    y0  = CAM_H
+def draw_panel(canvas, tr, level, fusion=None):
+    """
+    Panel layout (3 zones across PANEL_H px):
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  ZONE A (left 210px)   │  ZONE B (middle 290px) │  ZONE C(right140px)│
+    │  Big live readouts     │  4 sparklines stacked  │  TTC gauge     │
+    │  • Distance            │  • Distance (m)        │  Arc + number  │
+    │  • Obj speed           │  • Object speed        │  Fused vs cam  │
+    │  • Vehicle speed       │  • Vehicle speed       │                │
+    │  • Closing speed       │  • Closing speed       │                │
+    ├─────────────────────────────────────────────────────────────────┤
+    │  ZONE D (full width, bottom 16px) — 7-step level ladder strip  │
+    └─────────────────────────────────────────────────────────────────┘
+    """
+    y0      = CAM_H
+    STRIP_H = 18          # level ladder at very bottom
+    PAD     = 6
     canvas[y0:, :] = PLOT_BG
-    cv2.line(canvas, (0,y0), (CAM_W,y0), (50,55,70), 1)
+    cv2.line(canvas, (0, y0), (CAM_W, y0), (55, 60, 75), 1)
 
-    # ── 4 sparkline cells ─────────────────────────────────────────────────────
-    cw   = CAM_W // 4
-    ph   = PANEL_H - 72    # plot area height — more space for bigger readouts
-    py   = y0 + 18
-    pad  = 5
+    usable_h = PANEL_H - STRIP_H - 4   # height available for zones A/B/C
 
-    cells = [
-        (0*cw+pad, "DISTANCE (m)", COL_DIST,  tr.dist_hist,   0., 5.),
-        (1*cw+pad, "SPEED (m/s)",  COL_SPEED, tr.speed_hist,  0., 3.),
-        (2*cw+pad, "GROWTH",       COL_GR,    tr.growth_hist,-0.1, 0.3),
-        (3*cw+pad, "TTC (s ≤10)",  COL_TTC,   tr.ttc_hist,    0.,10.),
+    # ── Zone widths ───────────────────────────────────────────────────────────
+    ZA_W = 195    # big readouts
+    ZC_W = 138    # TTC gauge
+    ZB_W = CAM_W - ZA_W - ZC_W   # sparklines
+
+    ZA_X = 0
+    ZB_X = ZA_W
+    ZC_X = ZA_W + ZB_W
+
+    # Dividers
+    cv2.line(canvas, (ZB_X, y0), (ZB_X, y0+usable_h), (45, 50, 65), 1)
+    cv2.line(canvas, (ZC_X, y0), (ZC_X, y0+usable_h), (45, 50, 65), 1)
+
+    # ══ ZONE A — Big live readouts ════════════════════════════════════════════
+    # Each readout: small label on top, big value below
+    def big_readout(label, value_str, unit_str, x, y, val_col, label_col=(90,95,110)):
+        cv2.putText(canvas, label,    (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, label_col, 1)
+        cv2.putText(canvas, value_str,(x, y+18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, val_col, 2)
+        cv2.putText(canvas, unit_str, (x, y+32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, label_col, 1)
+
+    row_h  = usable_h // 4
+    ax     = ZA_X + PAD
+
+    # 1. Distance
+    dist_val = f"{tr.dist_f:.2f}" if tr.dist_f else "---"
+    dc = (60,200,255)
+    big_readout("DISTANCE", dist_val, "metres", ax, y0+PAD+row_h*0+12, dc)
+
+    # 2. Object speed
+    obj_ms  = max(0.0, tr.speed_f)
+    obj_kmh = obj_ms * 3.6
+    oc = (50,240,50) if obj_ms<0.5 else (0,210,255) if obj_ms<1.5 else (0,80,255)
+    big_readout("OBJECT SPD", f"{obj_kmh:.1f}", "km/h (approach)", ax, y0+PAD+row_h*1+12, oc)
+
+    # 3. Vehicle speed (IMU)
+    if fusion:
+        veh_ms  = fusion["veh_contrib_ms"]
+        veh_kmh = veh_ms * 3.6
+        vc = (80,130,255)
+        src_tag = "km/h  [IMU:REAL]" if fusion.get("real_imu") else "km/h  [IMU:SIM]"
+        big_readout("VEHICLE SPD", f"{veh_kmh:.1f}", src_tag, ax, y0+PAD+row_h*2+12, vc)
+    else:
+        big_readout("VEHICLE SPD", "---", "IMU off", ax, y0+PAD+row_h*2+12, (55,60,70))
+
+    # 4. Closing speed (fused = obj + vehicle contribution)
+    if fusion:
+        cspd_ms  = fusion["closing_speed"]
+        cspd_kmh = cspd_ms * 3.6
+        cc = (50,230,50) if cspd_ms<1.0 else (0,200,255) if cspd_ms<2.5 else (0,50,255)
+        big_readout("CLOSING SPD", f"{cspd_kmh:.1f}", "km/h (obj+veh)", ax, y0+PAD+row_h*3+12, cc)
+    else:
+        big_readout("CLOSING SPD", f"{obj_kmh:.1f}", "km/h (cam only)", ax, y0+PAD+row_h*3+12, oc)
+
+    # ══ ZONE B — 4 stacked sparklines with axis labels ════════════════════════
+    n_plots  = 4
+    plot_h   = (usable_h - PAD*2) // n_plots - 2
+    plot_w   = ZB_W - PAD*2 - 28    # -28 for right-side y-axis labels
+    bx       = ZB_X + PAD
+    label_x  = bx + plot_w + 3
+
+    plots = [
+        ("DIST m",      COL_DIST,  tr.dist_hist,        0.,  5.,  "0","5m"),
+        ("OBJ km/h",    COL_SPEED, [v*3.6 for v in tr.speed_hist],  0., 15., "0","15"),
+        ("VEH km/h",    COL_VSPD,  [v*3.6 for v in (fusion["vspd_hist"] if fusion else [])], 0., 15., "0","15"),
+        ("CLOSE km/h",  COL_CLOSE, [v*3.6 for v in (fusion["close_hist"] if fusion else [])],0., 20., "0","20"),
     ]
-    for x0c,lbl,col,data,vmin,vmax in cells:
-        pw = cw - pad*2
-        cv2.rectangle(canvas,(x0c,py),(x0c+pw,py+ph),GRID_COL,1)
-        for yi in [py+ph//3, py+2*ph//3]:
-            cv2.line(canvas,(x0c,yi),(x0c+pw,yi),(25,28,38),1)
-        # larger label
-        cv2.putText(canvas, lbl, (x0c+3, py-4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
-        sparkline(canvas, data, x0c, py, pw, ph, col, vmin, vmax,
-                  zero_line=0. if vmin<0 else None)
-        # larger latest value inside plot
+
+    for i,(lbl,col,data,vmin,vmax,lo_lbl,hi_lbl) in enumerate(plots):
+        py  = y0 + PAD + i*(plot_h+2)
+        # background
+        cv2.rectangle(canvas,(bx,py),(bx+plot_w,py+plot_h),(22,25,33),-1)
+        # grid lines at 1/3 and 2/3
+        for frac in [0.33,0.67]:
+            gy=int(py+plot_h*(1-frac))
+            cv2.line(canvas,(bx,gy),(bx+plot_w,gy),(32,36,48),1)
+        # border
+        cv2.rectangle(canvas,(bx,py),(bx+plot_w,py+plot_h),(45,50,65),1)
+        # label left of plot
+        cv2.putText(canvas,lbl,(ZB_X+2,py+plot_h//2+4),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.26,col,1)
+        # sparkline
+        sparkline(canvas,data,bx,py,plot_w,plot_h,col,vmin,vmax)
+        # y-axis tick labels
+        cv2.putText(canvas,hi_lbl,(label_x,py+8),        cv2.FONT_HERSHEY_SIMPLEX,0.24,(70,75,90),1)
+        cv2.putText(canvas,lo_lbl,(label_x,py+plot_h-2), cv2.FONT_HERSHEY_SIMPLEX,0.24,(70,75,90),1)
+        # latest value — right-justified inside plot
         if data:
-            cv2.putText(canvas, f"{list(data)[-1]:.2f}",
-                        (x0c+3, py+ph-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1)
+            last = list(data)[-1]
+            vstr = f"{last:.1f}"
+            tw   = len(vstr)*7
+            cv2.putText(canvas,vstr,(bx+plot_w-tw-2,py+plot_h-4),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.32,col,1)
 
-    # ── Big readout row ───────────────────────────────────────────────────────
-    # Two rows so text isn't cramped
-    by1 = y0 + PANEL_H - 50
-    by2 = y0 + PANEL_H - 30
+    # ══ ZONE C — TTC gauge (arc + large number + cam vs fused comparison) ═════
+    gx   = ZC_X + ZC_W//2
+    gy   = y0 + usable_h//2 - 10
+    grad = 44     # gauge radius
 
-    dist_s = f"DIST  {tr.dist_f:.2f} m"  if tr.dist_f else "DIST  ---"
-    spd_s  = f"SPD  {tr.speed_kmh():.1f} km/h"
-    gr     = tr.growth()
-    gr_s   = f"GROW  {gr:+.3f}"
-    ttc    = tr.ttc()
-    ttc_s  = f"TTC  {ttc:.1f} s"  if ttc < 99 else "TTC  ---"
+    # Determine values
+    cam_ttc   = tr.ttc()
+    fused_ttc = fusion["fused_ttc"] if fusion else cam_ttc
+    display_ttc = fused_ttc        # primary display value
 
-    sc = (50,240,50)  if tr.speed_f < 0.5  else \
-         (0,200,255)  if tr.speed_f < 1.5  else (0,80,255)
-    tc = (50,240,50)  if ttc > 5    else \
-         (0,180,255)  if ttc > 2    else (0,50,255)
+    # Arc background (grey)
+    cv2.ellipse(canvas,(gx,gy),(grad,grad),0,200,340,(40,45,55),4)
 
-    # Row 1 — distance + speed
-    cv2.putText(canvas, dist_s, (8,       by1), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160,185,210), 1)
-    cv2.putText(canvas, spd_s,  (185,     by1), cv2.FONT_HERSHEY_SIMPLEX, 0.52, sc,            1)
+    # Arc fill — maps TTC 0–8s to angle
+    # 0s (danger) = 200°, 8s (safe) = 340°
+    ttc_clamped = np.clip(display_ttc, 0, 8)
+    arc_end     = int(200 + (ttc_clamped/8.0)*140)
+    arc_col     = (0,40,255) if display_ttc<2 else \
+                  (0,120,255) if display_ttc<4 else \
+                  (0,220,255) if display_ttc<6 else (50,240,80)
+    cv2.ellipse(canvas,(gx,gy),(grad,grad),0,200,arc_end,arc_col,4)
 
-    # Row 2 — growth + TTC + edge/reentry tag
-    cv2.putText(canvas, gr_s,   (8,       by2), cv2.FONT_HERSHEY_SIMPLEX, 0.52, COL_GR,        1)
-    cv2.putText(canvas, ttc_s,  (185,     by2), cv2.FONT_HERSHEY_SIMPLEX, 0.52, tc,            1)
-    if tr.reentry_count > 0:
-        cv2.putText(canvas, f"RE-ENTRY x{tr.reentry_count}",
-                    (370, by2), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0,100,255), 1)
+    # Needle tip dot
+    angle_rad = np.radians(arc_end)
+    nx = int(gx + grad * np.cos(angle_rad))
+    ny = int(gy + grad * np.sin(angle_rad))
+    cv2.circle(canvas,(nx,ny),4,arc_col,-1)
 
-    # ── Level legend strip ────────────────────────────────────────────────────
-    lby  = y0 + PANEL_H - 14
+    # Centre number
+    ttc_str = f"{display_ttc:.1f}" if display_ttc<99 else "∞"
+    tw      = len(ttc_str)*10
+    cv2.putText(canvas,"TTC",(gx-10,gy-12),cv2.FONT_HERSHEY_SIMPLEX,0.34,(100,110,130),1)
+    cv2.putText(canvas,ttc_str,(gx-tw//2,gy+10),cv2.FONT_HERSHEY_SIMPLEX,0.80,arc_col,2)
+    cv2.putText(canvas,"sec",(gx-8,gy+26),cv2.FONT_HERSHEY_SIMPLEX,0.30,(80,85,100),1)
+
+    # Cam vs Fused comparison (below gauge)
+    cy2 = gy + grad + 12
+    tc2 = (50,240,50) if cam_ttc>5 else (0,180,255) if cam_ttc>2 else (0,50,255)
+    tf2 = (50,240,50) if fused_ttc>5 else (0,180,255) if fused_ttc>2 else (0,50,255)
+    cv2.putText(canvas,f"CAM  {cam_ttc:.1f}s",  (ZC_X+PAD, cy2),   cv2.FONT_HERSHEY_SIMPLEX,0.34,tc2,1)
+    cv2.putText(canvas,f"FUSE {fused_ttc:.1f}s",(ZC_X+PAD, cy2+14),cv2.FONT_HERSHEY_SIMPLEX,0.34,tf2,1)
+
+    # Growth bar — thin vertical bar on far right of zone C
+    gbx   = ZC_X + ZC_W - 10
+    gr_val= tr.growth()
+    gb_h  = usable_h - PAD*2
+    gby   = y0 + PAD
+    cv2.rectangle(canvas,(gbx,gby),(gbx+6,gby+gb_h),(28,30,38),-1)
+    fill  = int(np.clip(gr_val/0.20,0,1)*gb_h)
+    if fill>0:
+        gcol=(50,200,50) if gr_val<0.05 else (0,160,255) if gr_val<0.12 else (0,40,255)
+        cv2.rectangle(canvas,(gbx,gby+gb_h-fill),(gbx+6,gby+gb_h),gcol,-1)
+    cv2.putText(canvas,"G",(gbx,gby-2),cv2.FONT_HERSHEY_SIMPLEX,0.28,(80,85,100),1)
+    cv2.putText(canvas,f"{gr_val:.2f}",(gbx-14,gby+gb_h+8),cv2.FONT_HERSHEY_SIMPLEX,0.26,COL_GR,1)
+
+    # ══ ZONE D — Level ladder strip ═══════════════════════════════════════════
+    lby  = y0 + PANEL_H - STRIP_H
     step = CAM_W // 7
     for lvl, cfg in LEVELS.items():
         lx     = lvl * step
         active = (lvl == level)
-        cv2.rectangle(canvas, (lx,lby), (lx+step-1, lby+12),
-                      cfg["bg"] if active else (20,22,28), -1)
-        short = cfg["label"][:8]
-        col   = cfg["fg"] if active else (45,50,60)
-        cv2.putText(canvas, short, (lx+2, lby+9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.24, col, 1)
+        lw     = step if lvl < 6 else CAM_W - lx   # last cell takes remainder
+        bg     = cfg["bg"]   if active else (18, 20, 27)
+        fg     = cfg["fg"]   if active else (42, 47, 58)
+        cv2.rectangle(canvas,(lx,lby),(lx+lw-1,lby+STRIP_H-1),bg,-1)
+        if active:
+            cv2.rectangle(canvas,(lx,lby),(lx+lw-1,lby+STRIP_H-1),cfg["fg"],1)
+        short  = cfg["label"][:8]
+        cv2.putText(canvas,short,(lx+3,lby+12),cv2.FONT_HERSHEY_SIMPLEX,0.26,fg,1)
+        # level number
+        cv2.putText(canvas,str(lvl),(lx+lw-10,lby+12),cv2.FONT_HERSHEY_SIMPLEX,0.24,
+                    cfg["fg"] if active else (35,38,48),1)
 
-    # ── Approach speed bar ────────────────────────────────────────────────────
-    bar_y = y0 + PANEL_H - 2
-    sn    = np.clip(tr.speed_f / 3., 0, 1)
-    bw    = int(sn * CAM_W)
-    bcol  = (50,220,50) if sn<0.3 else (0,200,255) if sn<0.6 else (0,50,255)
-    canvas[bar_y-4:bar_y+1, :]   = (20,22,28)
-    if bw > 0:
-        canvas[bar_y-4:bar_y+1, :bw] = bcol
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -623,65 +903,101 @@ def main():
     if not cap.isOpened(): print("[ERROR] No camera"); return
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, DISP_W, DISP_H + 130)   # +130 for trackbar rows
+    cv2.resizeWindow(WIN, DISP_W, DISP_H + 180)   # +180 for 6 trackbar rows
 
-    cv2.createTrackbar("Speed Smooth  1=smooth 100=raw",  WIN, 15,100,nothing)
-    cv2.createTrackbar("TTC Warn   (x0.1s) def=40",       WIN, 40,100,nothing)
-    cv2.createTrackbar("TTC Critical(x0.1s) def=18",      WIN, 18, 50,nothing)
-    cv2.createTrackbar("Path Width %  def=40",             WIN, 40, 80,nothing)
-    cv2.createTrackbar("Min Speed (x0.1m/s) def=2",       WIN,  2, 20,nothing)
+    # ── Sliders ───────────────────────────────────────────────────────────────
+    cv2.createTrackbar("Speed Smooth  1=smooth 100=raw",  WIN, 15, 100, nothing)
+    cv2.createTrackbar("TTC Warn   (x0.1s) def=40",       WIN, 40, 100, nothing)
+    cv2.createTrackbar("TTC Critical(x0.1s) def=18",      WIN, 18,  50, nothing)
+    cv2.createTrackbar("Path Width %  def=40",             WIN, 40,  80, nothing)
+    cv2.createTrackbar("Min Speed (x0.1m/s) def=2",       WIN,  2,  20, nothing)
+    # IMU weight: how much vehicle speed contributes to closing speed / fused TTC
+    #   0  = camera only (IMU ignored — use when vehicle is stationary or IMU uncalibrated)
+    #  50  = half contribution
+    # 100  = full fusion (recommended once IMU is calibrated on Pi)
+    cv2.createTrackbar("IMU Weight  0=off 100=full",       WIN, 80, 100, nothing)
 
+    # ── Objects ───────────────────────────────────────────────────────────────
     detector  = ArucoDetector()
     tracker   = Tracker()
     state_m   = AlertStateMachine()
     gpio_ctrl = OutputController()
-    # canvas stays at NATIVE resolution — all processing coords are correct
-    canvas    = np.zeros((WIN_H, CAM_W, 3), dtype=np.uint8)
-    fps_t=time.time(); fcnt=0; last_det=None
+    imu_sim   = SimulatedIMU()
+    vel_est   = VehicleVelocityEstimator()
+    fusion_eng= FusionEngine()
 
-    print(f"[INFO] Tracking ID {TARGET_ID} | 7 alert levels | Q to quit")
-    print(f"[INFO] Display: {DISP_W}×{DISP_H}  |  Processing: {CAM_W}×{CAM_H}  |  Scale: {DISP_SCALE}x")
-    print( "[INFO] Level guide:")
-    for lvl,cfg in LEVELS.items():
-        horn ="HORN " if cfg["sound"] else "     "
-        light="LIGHT" if cfg["gpio"] else "     "
-        print(f"  {lvl}: {cfg['label']:20s}  {horn} {light}")
+    # canvas stays at NATIVE resolution — all CV coordinates are correct
+    canvas    = np.zeros((WIN_H, CAM_W, 3), dtype=np.uint8)
+    fps_t     = time.time(); fcnt=0; last_det=None
+
+    # Current vehicle speed (updated every frame from simulated IMU)
+    veh_spd_ms = 0.0
+
+    print(f"[INFO] Tracking ID {TARGET_ID} | 7 alert levels + sensor fusion | Q to quit")
+    print(f"[INFO] Display {DISP_W}×{DISP_H}  |  Processing {CAM_W}×{CAM_H}  |  Scale {DISP_SCALE}x")
+    print( "[INFO] IMU: SimulatedIMU (swap imu_sim for real MPU6050 on Pi)")
     print()
 
     while True:
-        ret,frame=cap.read()
+        ret, frame = cap.read()
         if not ret: break
-        fcnt+=1
+        fcnt += 1
 
-        # Sliders
-        sm   = max(1,cv2.getTrackbarPos("Speed Smooth  1=smooth 100=raw",WIN))
-        ttc_w= cv2.getTrackbarPos("TTC Warn   (x0.1s) def=40",      WIN)*0.1
-        ttc_c= cv2.getTrackbarPos("TTC Critical(x0.1s) def=18",     WIN)*0.1
-        pw   = max(10,cv2.getTrackbarPos("Path Width %  def=40",     WIN))
-        mspd = cv2.getTrackbarPos("Min Speed (x0.1m/s) def=2",      WIN)*0.1
-        ttc_c= min(ttc_c, ttc_w-0.1)
+        # ── Read sliders ──────────────────────────────────────────────────────
+        sm     = max(1, cv2.getTrackbarPos("Speed Smooth  1=smooth 100=raw", WIN))
+        ttc_w  = cv2.getTrackbarPos("TTC Warn   (x0.1s) def=40",       WIN) * 0.1
+        ttc_c  = cv2.getTrackbarPos("TTC Critical(x0.1s) def=18",      WIN) * 0.1
+        pw     = max(10, cv2.getTrackbarPos("Path Width %  def=40",     WIN))
+        mspd   = cv2.getTrackbarPos("Min Speed (x0.1m/s) def=2",       WIN) * 0.1
+        imu_w  = cv2.getTrackbarPos("IMU Weight  0=off 100=full",       WIN) / 100.0
+        ttc_c  = min(ttc_c, ttc_w - 0.1)
 
-        q_val= 0.001*(10**(sm/50.0))
-        px1  = int(CAM_W*(0.5-pw/200.))
-        px2  = int(CAM_W*(0.5+pw/200.))
+        q_val  = 0.001 * (10 ** (sm / 50.0))
+        px1    = int(CAM_W * (0.5 - pw / 200.))
+        px2    = int(CAM_W * (0.5 + pw / 200.))
 
-        # ── All processing at native 640×480 ──────────────────────────────────
+        # ── IMU step — one sample per camera frame (≈30 Hz) ──────────────────
+        # On Pi: replace imu_sim.step() with real_imu.get_data()
+        # and pass ax from calibrated MPU6050 into vel_est.update()
+        ax_raw, true_spd = imu_sim.step()
+        veh_spd_ms = vel_est.update(ax_raw)
+
+        # ── Camera processing at native 640×480 ───────────────────────────────
         det = detector.detect(frame)
-        tracker.update(det,px1,px2,q_val)
-        if det: last_det=det
+        tracker.update(det, px1, px2, q_val)
+        if det: last_det = det
 
-        level, edge_case = state_m.evaluate(tracker, ttc_w, ttc_c, mspd)
+        # ── Sensor fusion ─────────────────────────────────────────────────────
+        fusion_result = None
+        if tracker.dist_f is not None:
+            fusion_result = fusion_eng.compute(
+                obj_spd_ms = tracker.speed_f,
+                veh_spd_ms = veh_spd_ms,
+                dist_m     = tracker.dist_f,
+                imu_weight = imu_w,
+            )
+            # pass deque refs into result for panel sparklines
+            fusion_result["vspd_hist"]  = fusion_eng.vspd_hist
+            fusion_result["fttc_hist"]  = fusion_eng.fttc_hist
+            fusion_result["close_hist"] = fusion_eng.closing_hist
+            fusion_result["real_imu"]   = False   # flip to True on Pi
+
+        fused_ttc = fusion_result["fused_ttc"] if fusion_result else None
+
+        # ── Alert state machine — uses fused TTC when available ───────────────
+        level, edge_case = state_m.evaluate(tracker, ttc_w, ttc_c, mspd, fused_ttc)
         gpio_ctrl.apply_level(level)
 
-        draw_path(frame,px1,px2)
-        draw_marker(frame,tracker,last_det if tracker.active else None,level)
-        fps=fcnt/(time.time()-fps_t+1e-5)
-        draw_banner(frame,level,edge_case,fps,tracker,gpio_ctrl)
+        # ── Draw ──────────────────────────────────────────────────────────────
+        draw_path(frame, px1, px2)
+        draw_marker(frame, tracker, last_det if tracker.active else None, level)
+        fps = fcnt / (time.time() - fps_t + 1e-5)
+        draw_banner(frame, level, edge_case, fps, tracker, gpio_ctrl)
 
-        canvas[:CAM_H,:] = frame
-        draw_panel(canvas, tracker, level)
+        canvas[:CAM_H, :] = frame
+        draw_panel(canvas, tracker, level, fusion=fusion_result)
 
-        # ── Single upscale at display time only — zero compute cost ───────────
+        # ── Single upscale for display only — zero overhead on processing ─────
         if DISP_SCALE != 1.0:
             display = cv2.resize(canvas, (DISP_W, DISP_H),
                                  interpolation=cv2.INTER_LINEAR)
@@ -689,9 +1005,11 @@ def main():
             display = canvas
 
         cv2.imshow(WIN, display)
-        if cv2.waitKey(1)&0xFF==ord('q'): break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    cap.release(); cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()
     print("[INFO] Done.")
 
 if __name__=="__main__":
