@@ -130,7 +130,7 @@ class TrackerProfile:
 class ObjectTracker:
     _LK = dict(winSize=(21, 21), maxLevel=3,
                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 25, 0.01))
-    _FT = dict(maxCorners=80, qualityLevel=0.06, minDistance=5, blockSize=5)
+    _FT = dict(maxCorners=150, qualityLevel=0.03, minDistance=6, blockSize=7)
     MIN_PTS     = 6
     VERIFY_N    = 12
     VERIFY_THR  = 0.38
@@ -450,94 +450,125 @@ def assess(tracker: ObjectTracker, vspd: VehicleSpeed) -> tuple:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DRAWING
+# All draw functions receive a `disp` canvas that is already at display
+# resolution (CAM_W*DS × WIN_H*DS). Coordinates passed in are logical
+# (640×480 space); s() scales them to display pixels. Text is rendered at
+# native display resolution so it is never blurry or pixelated.
 # ──────────────────────────────────────────────────────────────────────────────
 _DARK = (16, 18, 26)
 _MID  = (30, 34, 46)
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# DS is set in main() before any draw call
+DS = 1.5
+
+def s(v):
+    """Scale a single logical coordinate/size to display pixels."""
+    return int(round(v * DS))
+
+def sp(pt):
+    """Scale a (x,y) logical point."""
+    return (s(pt[0]), s(pt[1]))
+
+def txt(img, text, lx, ly, scale, col, thick=1, anchor="bl"):
+    """
+    Draw anti-aliased text at logical position (lx, ly) scaled to display res.
+    anchor: 'bl' = baseline-left (default), 'tl' = top-left
+    """
+    fs  = scale * DS          # font scale at display resolution
+    th  = max(1, int(thick * DS * 0.67))
+    if anchor == "tl":
+        (tw, th_px), bl = cv2.getTextSize(text, _FONT, fs, th)
+        ly = ly + th_px / DS  # convert back to logical for the s() call below
+    cv2.putText(img, text, (s(lx), s(ly)), _FONT, fs, col, th, cv2.LINE_AA)
 
 
-def sparkline(canvas, data, x, y, w, h, col, vmin=0., vmax=1.):
+def sparkline(disp, data, x, y, w, h, col, vmin=0., vmax=1.):
+    """Draw sparkline; all coords are logical, scaled inside."""
     arr = np.array(list(data), dtype=np.float32)
     if len(arr) < 2: return
     rng = max(vmax - vmin, 1e-6)
-    xs  = np.linspace(x, x + w - 1, len(arr)).astype(int)
-    ys  = np.clip((y + h - 1 - ((arr - vmin) / rng * (h - 2))).astype(int), y, y+h-1)
+    # work in display pixels
+    dx, dy = s(x), s(y); dw, dh = s(w), s(h)
+    xs = np.linspace(dx, dx + dw - 1, len(arr)).astype(int)
+    ys = np.clip((dy + dh - 1 - ((arr - vmin) / rng * (dh - 2))).astype(int),
+                 dy, dy + dh - 1)
     pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
-    cv2.polylines(canvas, [pts], False, col, 1, cv2.LINE_AA)
+    cv2.polylines(disp, [pts], False, col, 1, cv2.LINE_AA)
 
 
-def draw_path_zone(frame):
+def draw_path_zone(disp):
+    """Subtle green corridor overlay — logical coords scaled."""
     x1, x2 = PATH_ZONE_X
-    ov = frame.copy()
-    cv2.rectangle(ov, (x1, 0), (x2, CAM_H), (0, 200, 80), -1)
-    cv2.addWeighted(ov, 0.06, frame, 0.94, 0, frame)
-    cv2.line(frame, (x1, 0), (x1, CAM_H), (0, 160, 60), 1)
-    cv2.line(frame, (x2, 0), (x2, CAM_H), (0, 160, 60), 1)
+    ov = disp.copy()
+    cv2.rectangle(ov, sp((x1, 0)), sp((x2, CAM_H)), (0, 200, 80), -1)
+    cv2.addWeighted(ov, 0.06, disp, 0.94, 0, disp)
+    cv2.line(disp, sp((x1, 0)), sp((x1, CAM_H)), (0, 160, 60), 1)
+    cv2.line(disp, sp((x2, 0)), sp((x2, CAM_H)), (0, 160, 60), 1)
 
 
-def draw_object(frame, tracker: ObjectTracker, alert_col):
+def draw_object(disp, tracker: ObjectTracker, alert_col):
     if not tracker.active or tracker.bbox is None: return
     x, y, w, h = tracker.bbox
     cx, cy = tracker.centre
 
-    cv2.rectangle(frame, (x, y), (x+w, y+h), alert_col, 2)
-    cv2.circle(frame, (cx, cy), 4, alert_col, -1)
+    cv2.rectangle(disp, sp((x, y)), sp((x+w, y+h)), alert_col, max(1, s(2)))
+    cv2.circle(disp, sp((cx, cy)), s(4), alert_col, -1)
 
     # Trail
     trail = list(tracker.trail)
     for i in range(1, len(trail)):
         a  = i / len(trail)
         tc = tuple(int(c * a) for c in alert_col)
-        cv2.line(frame, trail[i-1], trail[i], tc, 1, cv2.LINE_AA)
+        cv2.line(disp, sp(trail[i-1]), sp(trail[i]), tc, 1, cv2.LINE_AA)
 
-    # Direction arrow — lateral motion
+    # Direction arrow
     v_lat = tracker.lateral_ms
     if abs(v_lat) > 0.15:
         arrow_len = int(min(abs(v_lat) * 28, 70))
-        ax_end = (cx + (arrow_len if v_lat > 0 else -arrow_len), cy)
+        ax_end = sp((cx + (arrow_len if v_lat > 0 else -arrow_len), cy))
         acol   = (0, 220, 255) if abs(v_lat) < CROSS_SPD_FAST else (0, 50, 255)
-        cv2.arrowedLine(frame, (cx, cy), ax_end, acol, 2,
-                        tipLength=0.30, line_type=cv2.LINE_AA)
+        cv2.arrowedLine(disp, sp((cx, cy)), ax_end, acol,
+                        max(1, s(2)), tipLength=0.30, line_type=cv2.LINE_AA)
         sym = "->" if v_lat > 0 else "<-"
-        cv2.putText(frame, f"{sym} {abs(v_lat)*3.6:.1f}km/h",
-                    (x, max(y - 18, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.36, acol, 1)
+        txt(disp, f"{sym} {abs(v_lat)*3.6:.1f}km/h",
+            x, max(y - 18, 20), 0.36, acol)
 
-    # Approach speed label
-    cv2.putText(frame, f"{tracker.profile.label}  ^{tracker.speed_kmh():.1f}km/h",
-                (x, max(y - 4, 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, alert_col, 1)
+    # Approach label
+    txt(disp, f"{tracker.profile.label}  ^{tracker.speed_kmh():.1f}km/h",
+        x, max(y - 4, 32), 0.40, alert_col)
 
 
-def draw_lost_indicator(frame, tracker: ObjectTracker):
+def draw_lost_indicator(disp, tracker: ObjectTracker):
     if not tracker.lost: return
     if int(time.time() * 3) % 2 == 0:
-        cv2.putText(frame, "TARGET LOST  searching...",
-                    (CAM_W//2 - 120, CAM_H//2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 220), 2)
+        txt(disp, "TARGET LOST  searching...",
+            CAM_W//2 - 120, CAM_H//2, 0.55, (0, 0, 220), thick=2)
 
 
-def draw_banner(frame, mode, label, detail, col, fps):
-    cv2.rectangle(frame, (0, 0), (CAM_W, 44), (14, 16, 22), -1)
+def draw_banner(disp, mode, label, detail, col, fps):
+    cv2.rectangle(disp, (0, 0), (s(CAM_W), s(44)), (14, 16, 22), -1)
     mc = (0, 220, 255) if mode == "CALIBRATE" else (80, 200, 80)
-    cv2.putText(frame, mode,   (8,  28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, mc,  2)
-    cv2.putText(frame, label, (160, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
+    txt(disp, mode,  8,  28, 0.65, mc,  thick=2)
+    txt(disp, label, 160, 28, 0.65, col, thick=2)
     if detail:
-        cv2.putText(frame, detail, (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.30,
-                    (160, 170, 185), 1)
-    cv2.putText(frame, f"FPS:{fps:.0f}", (CAM_W-65, 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (80, 88, 100), 1)
+        txt(disp, detail, 8, 42, 0.32, (160, 170, 185))
+    txt(disp, f"FPS:{fps:.0f}", CAM_W - 65, 14, 0.30, (80, 88, 100))
 
 
-def draw_hud(canvas, tracker: ObjectTracker, vspd: VehicleSpeed,
+def draw_hud(disp, tracker: ObjectTracker, vspd: VehicleSpeed,
              profile: TrackerProfile, alert_col, mode: str):
     PT = CAM_H; PH = 160
-    canvas[PT:, :] = _DARK
-    cv2.line(canvas, (0, PT), (CAM_W, PT), (50, 55, 70), 1)
+    # Fill panel area
+    cv2.rectangle(disp, sp((0, PT)), sp((CAM_W, PT+PH)), _DARK, -1)
+    cv2.line(disp, sp((0, PT)), sp((CAM_W, PT)), (50, 55, 70), 1)
 
     lx = 8
     def rv(lbl, val, unit, row, c):
         ry = PT + 18 + row * 36
-        cv2.putText(canvas, lbl,  (lx, ry-2),  cv2.FONT_HERSHEY_SIMPLEX, 0.27, (75,82,96), 1)
-        cv2.putText(canvas, val,  (lx, ry+14), cv2.FONT_HERSHEY_SIMPLEX, 0.62, c,          2)
-        cv2.putText(canvas, unit, (lx, ry+25), cv2.FONT_HERSHEY_SIMPLEX, 0.24, (58,65,78), 1)
+        txt(disp, lbl,  lx, ry-2,  0.28, (75, 82, 96))
+        txt(disp, val,  lx, ry+14, 0.62, c,            thick=2)
+        txt(disp, unit, lx, ry+25, 0.26, (58, 65, 78))
 
     if tracker.active and tracker.dist_f:
         d  = tracker.dist_f
@@ -551,13 +582,12 @@ def draw_hud(canvas, tracker: ObjectTracker, vspd: VehicleSpeed,
         rv("LATERAL",  f"{lat:.1f}", f"km/h {tracker.crossing_dir()}", 2, lc)
     else:
         msg = "LOST - searching" if tracker.lost else "No target"
-        cv2.putText(canvas, msg, (lx, PT+40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55,62,75), 1)
+        txt(disp, msg, lx, PT+40, 0.48, (55, 62, 75))
         if mode == "TRACK" and profile.is_ready:
-            cv2.putText(canvas, "Template search active...", (lx, PT+62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (50,60,80), 1)
+            txt(disp, "Template search active...", lx, PT+62, 0.34, (50, 60, 80))
 
     LW = 205
-    cv2.line(canvas, (LW, PT+4), (LW, PT+PH-4), (38, 42, 55), 1)
+    cv2.line(disp, sp((LW, PT+4)), sp((LW, PT+PH-4)), (38, 42, 55), 1)
 
     SX = LW+8; SW = 248; sh = (PH-18)//3 - 2
     plots = [("OBJ km/h", (100,255,140), tracker.spd_hist,  0., 15.),
@@ -565,20 +595,19 @@ def draw_hud(canvas, tracker: ObjectTracker, vspd: VehicleSpeed,
              ("DIST m",   (60,200,255),  tracker.dist_hist,  0., 10.)]
     for i, (lbl, c, data, lo, hi) in enumerate(plots):
         sy = PT + 8 + i * (sh + 3)
-        cv2.rectangle(canvas, (SX, sy), (SX+SW, sy+sh), _MID, 1)
-        cv2.putText(canvas, lbl, (SX+2, sy-2), cv2.FONT_HERSHEY_SIMPLEX, 0.25, c, 1)
-        sparkline(canvas, data, SX, sy, SW, sh, c, lo, hi)
+        cv2.rectangle(disp, sp((SX, sy)), sp((SX+SW, sy+sh)), _MID, 1)
+        txt(disp, lbl, SX+2, sy-2, 0.27, c)
+        sparkline(disp, data, SX, sy, SW, sh, c, lo, hi)
         if data:
-            cv2.putText(canvas, f"{list(data)[-1]:.1f}",
-                        (SX+SW-28, sy+sh-3), cv2.FONT_HERSHEY_SIMPLEX, 0.25, c, 1)
+            txt(disp, f"{list(data)[-1]:.1f}", SX+SW-32, sy+sh-3, 0.27, c)
 
-    cv2.line(canvas, (SX+SW+8, PT+4), (SX+SW+8, PT+PH-4), (38, 42, 55), 1)
+    cv2.line(disp, sp((SX+SW+8, PT+4)), sp((SX+SW+8, PT+PH-4)), (38, 42, 55), 1)
 
     RX = SX + SW + 16
     vc = (80, 130, 255)
-    cv2.putText(canvas, "VEHICLE", (RX, PT+14), cv2.FONT_HERSHEY_SIMPLEX, 0.27, (75,82,96), 1)
-    cv2.putText(canvas, f"{vspd.kmh():.1f}", (RX, PT+36), cv2.FONT_HERSHEY_SIMPLEX, 0.68, vc, 2)
-    cv2.putText(canvas, "km/h cam", (RX, PT+48), cv2.FONT_HERSHEY_SIMPLEX, 0.24, (55,62,75), 1)
+    txt(disp, "VEHICLE",        RX, PT+14, 0.28, (75, 82, 96))
+    txt(disp, f"{vspd.kmh():.1f}", RX, PT+36, 0.68, vc, thick=2)
+    txt(disp, "km/h cam",       RX, PT+48, 0.26, (55, 62, 75))
 
     gx = RX+52; gy = PT+108; gr = 38
     cspd = max(0.0, tracker.speed_f) + vspd.veh_ms
@@ -586,19 +615,19 @@ def draw_hud(canvas, tracker: ObjectTracker, vspd: VehicleSpeed,
     ttcv = min(ttcv, 99.0)
     gc   = (0,40,220) if ttcv<2 else (0,130,255) if ttcv<4 else \
            (0,220,255) if ttcv<6 else (50,220,50)
-    cv2.ellipse(canvas, (gx,gy), (gr,gr), 0, 200, 340, (38,42,52), 4)
-    cv2.ellipse(canvas, (gx,gy), (gr,gr), 0, 200,
-                int(200 + min(ttcv/8, 1)*140), gc, 4, cv2.LINE_AA)
-    cv2.putText(canvas, "TTC", (gx-13, gy-8), cv2.FONT_HERSHEY_SIMPLEX, 0.27, (75,82,96), 1)
+    cv2.ellipse(disp, sp((gx, gy)), (s(gr), s(gr)), 0, 200, 340, (38,42,52), s(4))
+    cv2.ellipse(disp, sp((gx, gy)), (s(gr), s(gr)), 0, 200,
+                int(200 + min(ttcv/8, 1)*140), gc, s(4), cv2.LINE_AA)
     ttc_str = f"{ttcv:.1f}" if ttcv < 99 else "---"
-    cv2.putText(canvas, ttc_str, (gx-16, gy+10), cv2.FONT_HERSHEY_SIMPLEX, 0.62, gc, 2)
-    cv2.putText(canvas, "sec", (gx-9, gy+24), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (58,65,78), 1)
+    txt(disp, "TTC",    gx-13, gy-8,  0.28, (75, 82, 96))
+    txt(disp, ttc_str,  gx-16, gy+10, 0.62, gc, thick=2)
+    txt(disp, "sec",    gx-9,  gy+24, 0.26, (58, 65, 78))
 
     mc = (0,220,255) if mode=="CALIBRATE" else (80,200,80)
-    cv2.rectangle(canvas, (0, PT+PH-16), (CAM_W, PT+PH), (18,20,26), -1)
+    cv2.rectangle(disp, sp((0, PT+PH-16)), sp((CAM_W, PT+PH)), (18,20,26), -1)
     hint = "  |  [R] re-acquire" if tracker.lost else ""
-    cv2.putText(canvas, f"[TAB] {mode}  |  {profile.label if profile.is_ready else 'no profile'}{hint}",
-                (6, PT+PH-4), cv2.FONT_HERSHEY_SIMPLEX, 0.27, mc, 1)
+    txt(disp, f"[TAB] {mode}  |  {profile.label if profile.is_ready else 'no profile'}{hint}",
+        6, PT+PH-4, 0.29, mc)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -628,27 +657,25 @@ class CalibUI:
         x2=max(self.p0[0],self.p1[0]); y2=max(self.p0[1],self.p1[1])
         self.rect = (x1,y1,x2-x1,y2-y1) if (x2-x1>10 and y2-y1>10) else None
 
-    def draw(self, frame):
+    def draw(self, disp):
         # Drag preview
         if self.drawing and self.p0 and self.p1:
-            cv2.rectangle(frame, self.p0, self.p1, (0,220,255), 1)
+            cv2.rectangle(disp, sp(self.p0), sp(self.p1), (0, 220, 255), 1)
 
         # Finalised box
         if self.rect:
-            x,y,w,h = self.rect
-            cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,120), 2)
-            cv2.putText(frame, f"box:{w}x{h}px  real:{self.real_width}m  @{self.calib_dist}m",
-                        (x, max(y-6, 56)), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0,255,120), 1)
+            x, y, w, h = self.rect
+            cv2.rectangle(disp, sp((x,y)), sp((x+w,y+h)), (0, 255, 120), s(2))
+            txt(disp, f"box:{w}x{h}px  real:{self.real_width}m  @{self.calib_dist}m",
+                x, max(y-6, 56), 0.36, (0, 255, 120))
 
-        # 1-metre ruler at bottom of frame
-        # Tells you exactly how big 1m looks at your chosen calibration distance
+        # 1-metre ruler
         ruler_px = max(10, int(FOCAL_PX / self.calib_dist))
         rx = CAM_W//2 - ruler_px//2; ry = CAM_H - 22
-        cv2.line(frame,  (rx,ry),   (rx+ruler_px,ry),  (0,200,200), 2)
-        cv2.line(frame,  (rx,ry-5), (rx,ry+5),          (0,200,200), 2)
-        cv2.line(frame,  (rx+ruler_px,ry-5), (rx+ruler_px,ry+5), (0,200,200), 2)
-        cv2.putText(frame, f"<-- 1m at {self.calib_dist:.1f}m -->",
-                    (rx, ry-7), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0,200,200), 1)
+        cv2.line(disp, sp((rx, ry)),  sp((rx+ruler_px, ry)),  (0,200,200), s(2))
+        cv2.line(disp, sp((rx, ry-5)), sp((rx, ry+5)),         (0,200,200), s(2))
+        cv2.line(disp, sp((rx+ruler_px, ry-5)), sp((rx+ruler_px, ry+5)), (0,200,200), s(2))
+        txt(disp, f"<-- 1m at {self.calib_dist:.1f}m -->", rx, ry-7, 0.34, (0,200,200))
 
         # Instructions
         lines = [
@@ -658,7 +685,7 @@ class CalibUI:
         ]
         for i, ln in enumerate(lines):
             c = (0,220,255) if i==0 else (160,170,185) if i==1 else (90,100,115)
-            cv2.putText(frame, ln, (8, CAM_H-54+i*18), cv2.FONT_HERSHEY_SIMPLEX, 0.30, c, 1)
+            txt(disp, ln, 8, CAM_H-54+i*18, 0.31, c)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -668,6 +695,7 @@ WIN = "Animal Pre-Collision Tracker"
 
 
 def main():
+    global DS
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
@@ -680,11 +708,17 @@ def main():
     vspd    = VehicleSpeed()
     calib   = CalibUI()
 
-    PH   = 160; WIN_H = CAM_H + PH; DS = 1.5
-    canvas = np.zeros((WIN_H, CAM_W, 3), dtype=np.uint8)
+    PH    = 160
+    WIN_H = CAM_H + PH
+    DS    = 1.5   # display scale — update module-level so s()/sp()/txt() use it
+
+    # Display canvas is always at full display resolution
+    DDISP_W = int(CAM_W * DS)
+    DDISP_H = int(WIN_H * DS)
+    disp = np.zeros((DDISP_H, DDISP_W, 3), dtype=np.uint8)
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, int(CAM_W*DS), int(WIN_H*DS))
+    cv2.resizeWindow(WIN, DDISP_W, DDISP_H)
 
     mode = "CALIBRATE"
     if profile.load():
@@ -697,21 +731,22 @@ def main():
 
     def on_mouse(ev, wx, wy, flags, param):
         if mode != "CALIBRATE": return
-        calib.on_mouse(ev, int(wx/DS), int(wy/DS), flags, param)
+        # Mouse coords are in display pixels; convert to logical
+        calib.on_mouse(ev, int(wx / DS), int(wy / DS), flags, param)
 
     cv2.setMouseCallback(WIN, on_mouse)
     print("[INFO] TAB=mode  S=save  R=re-acquire  Q=quit")
     print("[INFO] W/w=width  D/d=distance  L=label")
 
     fps_t = time.time(); fcnt = 0
-    re_search_n = 30   # retry template match every N frames when LOST
+    re_search_n = 30
 
     while True:
         ret, frame = cap.read()
         if not ret: break
         fcnt += 1
         fps = fcnt / (time.time() - fps_t + 1e-6)
-
+        frame = cv2.flip(frame, 1)  # mirror horizontally
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"): break
 
@@ -745,15 +780,14 @@ def main():
             calib.label = opts[(idx+1) % len(opts)]
             print(f"[LABEL] -> {calib.label}")
 
-        # Auto-acquire / periodic re-search when LOST
+        # Auto-acquire / periodic re-search
         if mode == "TRACK" and profile.is_ready:
             if not tracker.active and not auto_tried:
-                tracker.try_acquire(frame)
-                auto_tried = True
+                tracker.try_acquire(frame); auto_tried = True
             elif tracker.lost and fcnt % re_search_n == 0:
                 tracker.try_acquire(frame, min_score=0.50)
 
-        # Calibrate: show live preview on drawn box
+        # Calibrate: live preview
         if mode == "CALIBRATE":
             if calib.rect and not tracker.active:
                 tracker.seed(frame, calib.rect)
@@ -766,17 +800,21 @@ def main():
 
         lvl, label, detail, col = assess(tracker, vspd)
 
-        draw_path_zone(frame)
-        draw_object(frame, tracker, col)
-        draw_lost_indicator(frame, tracker)
-        if mode == "CALIBRATE": calib.draw(frame)
-        draw_banner(frame, mode, label, detail, col, fps)
+        # ── Compose display ───────────────────────────────────────────────────
+        # 1. Upscale raw frame (image content only, no text)
+        frame_up = cv2.resize(frame, (DDISP_W, int(CAM_H * DS)),
+                              interpolation=cv2.INTER_LINEAR)
+        disp[:int(CAM_H * DS), :] = frame_up
 
-        canvas[:CAM_H, :] = frame
-        draw_hud(canvas, tracker, vspd, profile, col, mode)
+        # 2. Draw all overlays + text onto the display-res canvas
+        draw_path_zone(disp)
+        draw_object(disp, tracker, col)
+        draw_lost_indicator(disp, tracker)
+        if mode == "CALIBRATE": calib.draw(disp)
+        draw_banner(disp, mode, label, detail, col, fps)
+        draw_hud(disp, tracker, vspd, profile, col, mode)
 
-        cv2.imshow(WIN, cv2.resize(canvas, (int(CAM_W*DS), int(WIN_H*DS)),
-                                   interpolation=cv2.INTER_LINEAR))
+        cv2.imshow(WIN, disp)
 
     cap.release()
     cv2.destroyAllWindows()
