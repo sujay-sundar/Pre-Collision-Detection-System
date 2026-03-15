@@ -1,7 +1,7 @@
 {
   "real_w": 0.5,
   "calib_d": 2.0,
-  "px_w": 196,
-  "focal": 784.0,
+  "px_w": 59,
+  "focal": 236.0,
   "label": "animal"
 }
