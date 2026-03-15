@@ -11,8 +11,14 @@ Keys:
   R         force re-acquire from template
   Q         quit
   W/w       real width  +/- 0.05 m   (calibrate)
-  D/d       calib dist  +/- 0.5 m    (calibrate)
+  D/d       calib dist  +/- 0.5 m    (calibrate)  [disabled when sensor active]
   L         cycle label
+  U         cycle distance source: vision -> ultrasonic -> emulator
+
+Distance source (DISTANCE_SOURCE config):
+  "vision"      — manual D/d keys only (original behaviour)
+  "ultrasonic"  — HC-SR04 on RPi TRIG=GPIO14 ECHO=GPIO15 auto-fills calib dist
+  "emulator"    — on-screen trackbar slider (for PC testing without hardware)
 
 Calibration distance tip:
   Place the animal (or a stand-in object) at a known distance.
@@ -39,6 +45,102 @@ TTC_CRIT        = 2.0   # s
 CROSS_SPD_FAST  = 2.0   # m/s  lateral speed considered "fast crossing"
 VEH_SPD_CONCERN = 1.5   # m/s  vehicle speed that elevates risk
 
+# ── Bench-test motion scaling ──────────────────────────────────────────────────
+# Your setup moves cm; real traffic operates in metres.
+# MOTION_SCALE multiplies ALL distance/speed outputs so 10 cm feels like 1 m.
+# Set to 1.0 for real deployment.
+MOTION_SCALE    = 10.0
+
+# ── Distance source ────────────────────────────────────────────────────────────
+# "vision"      pixel-width estimation only  (no hardware needed)
+# "ultrasonic"  HC-SR04 feeds BOTH calibration AND live tracking distance
+# "emulator"    on-screen trackbar — PC testing without hardware
+DISTANCE_SOURCE     = "emulator"   # change to "ultrasonic" on the Pi
+
+ULTRASONIC_TRIG_PIN = 14   # BCM GPIO number
+ULTRASONIC_ECHO_PIN = 15   # BCM GPIO number
+
+EMULATOR_WIN        = "Distance Emulator"   # name of the trackbar window
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ULTRASONIC SENSOR  (HC-SR04 via RPi.GPIO)
+# TRIG=GPIO14  ECHO=GPIO15  (BCM numbering)
+# Gracefully no-ops on non-Pi hardware (ImportError / RuntimeError).
+# ──────────────────────────────────────────────────────────────────────────────
+class UltrasonicSensor:
+    _TIMEOUT = 0.04   # seconds — skip pulse if echo doesn't arrive
+
+    def __init__(self, trig: int = ULTRASONIC_TRIG_PIN,
+                 echo: int = ULTRASONIC_ECHO_PIN):
+        self._ok   = False
+        self._trig = trig
+        self._echo = echo
+        self._last = None
+        try:
+            import RPi.GPIO as GPIO
+            self._GPIO = GPIO
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(trig, GPIO.OUT)
+            GPIO.setup(echo, GPIO.IN)
+            GPIO.output(trig, False)
+            time.sleep(0.05)   # let sensor settle
+            self._ok = True
+            print(f"[ULTRASONIC] OK  TRIG=GPIO{trig}  ECHO=GPIO{echo}")
+        except ImportError:
+            print("[ULTRASONIC] RPi.GPIO not available — sensor disabled")
+        except Exception as e:
+            print(f"[ULTRASONIC] Init error: {e}")
+
+    @property
+    def available(self) -> bool:
+        return self._ok
+
+    def read(self) -> float | None:
+        """
+        Fire a pulse and return distance in metres.
+        Returns the last valid reading as fallback when the echo times out or is
+        out-of-range — prevents NoneType errors in callers that do arithmetic.
+        Returns None only on the very first call before any valid reading exists.
+        HC-SR04 rated range: 0.02 m – 4.0 m.
+        """
+        if not self._ok:
+            return self._last
+        GPIO = self._GPIO
+        try:
+            # Send 10 µs trigger pulse
+            GPIO.output(self._trig, True)
+            time.sleep(0.00001)
+            GPIO.output(self._trig, False)
+
+            # Wait for echo rising edge
+            t0 = time.time()
+            while GPIO.input(self._echo) == 0:
+                if time.time() - t0 > self._TIMEOUT:
+                    return self._last   # timeout — return last known good value
+            pulse_start = time.time()
+
+            # Wait for echo falling edge
+            while GPIO.input(self._echo) == 1:
+                if time.time() - pulse_start > self._TIMEOUT:
+                    return self._last
+            pulse_end = time.time()
+
+            dist_m = (pulse_end - pulse_start) * 17150 / 100   # speed-of-sound
+            if 0.02 <= dist_m <= 4.0:
+                self._last = round(dist_m, 3)
+            # Out-of-range: keep self._last as-is, still return it
+            return self._last
+        except Exception:
+            return self._last
+
+    def cleanup(self):
+        if self._ok:
+            try:
+                self._GPIO.cleanup([self._trig, self._echo])
+            except Exception:
+                pass
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # KALMAN  (2-state: distance + radial velocity)
@@ -51,7 +153,13 @@ class KalmanDist:
         self.R  = np.array([[0.004]])
         self._t = None
 
-    def update(self, z: float, q: float = 0.008):
+    def update(self, z: float, q: float = 0.008, r: float = 0.004):
+        """
+        z  — measured distance (m)
+        q  — process noise  (higher = trust measurement more, model less)
+        r  — measurement noise (lower = trust this measurement more)
+              vision default 0.004 | ultrasonic 0.0002 (hardware is accurate)
+        """
         now = time.time()
         dt  = float(np.clip((now - self._t) if self._t else 0.033, 0.005, 0.2))
         self._t = now
@@ -59,7 +167,8 @@ class KalmanDist:
         Q   = np.array([[q*dt**2, q*dt], [q*dt, q]])
         xp  = F @ self.x
         Pp  = F @ self.P @ F.T + Q
-        S   = float((self.H @ Pp @ self.H.T + self.R)[0, 0])
+        R_  = np.array([[r]])
+        S   = float((self.H @ Pp @ self.H.T + R_)[0, 0])
         K   = Pp @ self.H.T / S
         self.x = xp + K * (z - float((self.H @ xp)[0, 0]))
         self.P = (np.eye(2) - K @ self.H) @ Pp
@@ -87,7 +196,7 @@ class TrackerProfile:
 
     def dist_from_px(self, px_w: float) -> float:
         if px_w <= 0: return 99.0
-        return self._focal() * self.real_width_m / px_w
+        return self._focal() * self.real_width_m / px_w * MOTION_SCALE
 
     def save(self, frame_bgr: np.ndarray, rect: tuple):
         x, y, w, h = rect
@@ -132,9 +241,12 @@ class ObjectTracker:
                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 25, 0.01))
     _FT = dict(maxCorners=150, qualityLevel=0.03, minDistance=6, blockSize=7)
     MIN_PTS     = 6
-    VERIFY_N    = 12
+    TOPUP_THR   = 25    # reseed more points inside bbox when below this count
+    VERIFY_N    = 8     # template verify every N frames
     VERIFY_THR  = 0.38
-    LOST_THR    = 0.28
+    LOST_THR    = 0.30
+    BW_EMA_A    = 0.25  # EMA alpha for bbox width — reduces noisy distance jumps
+    TTC_EMA_A   = 0.15  # slow EMA on TTC — prevents jumps when closing speed is small
 
     def __init__(self, profile: TrackerProfile):
         self.profile   = profile
@@ -144,6 +256,8 @@ class ObjectTracker:
         self._bbox     = None
         self._fn       = 0
         self._state    = "IDLE"
+        self._bw_ema   = None   # EMA-smoothed bbox width (pixels)
+        self._ttc_ema  = 99.0  # EMA-smoothed TTC (seconds)
         self.dist_f    = None
         self.speed_f   = 0.0
         self.lateral_ms = 0.0
@@ -168,9 +282,25 @@ class ObjectTracker:
         return x + w // 2, y + h // 2
 
     def ttc(self) -> float:
+        """EMA-smoothed TTC — stable even when closing speed is noisy."""
         if self.dist_f and self.speed_f > 0.05:
-            return min(self.dist_f / self.speed_f, 99.0)
-        return 99.0
+            raw = min(self.dist_f / self.speed_f, 99.0)
+        else:
+            raw = 99.0
+        self._ttc_ema = self.TTC_EMA_A * raw + (1.0 - self.TTC_EMA_A) * self._ttc_ema
+        return self._ttc_ema
+
+    def inject_distance(self, dist_m: float):
+        """
+        Feed a trusted external distance (e.g. ultrasonic) into the Kalman.
+        Uses very low r so the sensor reading dominates over the model prediction.
+        Call this every frame when the ultrasonic sensor is active.
+        """
+        d, v = self.kf.update(dist_m, q=0.005, r=0.0002)
+        self.dist_f  = d
+        self.speed_f = v
+        self.dist_hist.append(d)
+        self.spd_hist.append(max(0.0, v))
 
     def speed_kmh(self) -> float:
         return max(0.0, self.speed_f) * 3.6
@@ -193,8 +323,10 @@ class ObjectTracker:
         self._pts   = corners + np.array([[[x, y]]], dtype=np.float32)
         self._pgray = gray.copy()
         self._bbox  = (x, y, w, h)
-        self._state = "TRACKING"
-        self._fn    = 0
+        self._state   = "TRACKING"
+        self._fn      = 0
+        self._bw_ema  = float(w)
+        self._ttc_ema = 99.0
         d0 = self.profile.dist_from_px(w)
         self.kf.reset(d0)
         self.dist_f = d0
@@ -219,7 +351,7 @@ class ObjectTracker:
 
     def reset(self):
         self._pts = None; self._pgray = None; self._bbox = None
-        self._state = "IDLE"
+        self._state = "IDLE"; self._bw_ema = None; self._ttc_ema = 99.0
         self.dist_f = None; self.speed_f = 0.0; self.lateral_ms = 0.0
         self.trail.clear(); self.kf.reset()
 
@@ -240,6 +372,20 @@ class ObjectTracker:
             self._go_lost()
             self._pgray = gray.copy(); return
 
+        # ── RANSAC outlier rejection ───────────────────────────────────────────
+        # estimateAffinePartial2D (scale+rotation+translation) with RANSAC
+        # removes flow vectors that don't belong to the same rigid motion.
+        if len(good_new) >= 6:
+            _, mask = cv2.estimateAffinePartial2D(
+                good_old.reshape(-1, 1, 2),
+                good_new.reshape(-1, 1, 2),
+                method=cv2.RANSAC, ransacReprojThreshold=3.0)
+            if mask is not None:
+                inliers = mask.flatten().astype(bool)
+                if inliers.sum() >= self.MIN_PTS:
+                    good_new = good_new[inliers]
+                    good_old = good_old[inliers]
+
         cx = int(np.median(good_new[:, 0, 0]))
         cy = int(np.median(good_new[:, 0, 1]))
 
@@ -259,7 +405,32 @@ class ObjectTracker:
         half_w = max(half_w, min_h); half_h = max(half_h, min_h)
         bx = max(0, cx - half_w); by = max(0, cy - half_h)
         bw = min(half_w * 2, CAM_W - bx); bh = min(half_h * 2, CAM_H - by)
+
+        # EMA-smooth the bbox width to reduce noisy distance jumps
+        if self._bw_ema is None:
+            self._bw_ema = float(bw)
+        else:
+            self._bw_ema = self.BW_EMA_A * bw + (1.0 - self.BW_EMA_A) * self._bw_ema
+        bw = max(4, int(self._bw_ema))
+
         self._bbox = (bx, by, bw, bh)
+
+        # ── Point top-up ──────────────────────────────────────────────────────
+        # If inlier count drops below threshold, reseed extra corners inside the
+        # current bbox so tracking doesn't degrade silently before going LOST.
+        if len(good_new) < self.TOPUP_THR:
+            pad = 4
+            rx1 = max(0, bx - pad); ry1 = max(0, by - pad)
+            rx2 = min(CAM_W, bx + bw + pad); ry2 = min(CAM_H, by + bh + pad)
+            patch = gray[ry1:ry2, rx1:rx2]
+            if patch.size > 0:
+                extra = cv2.goodFeaturesToTrack(
+                    patch, maxCorners=60, qualityLevel=0.03,
+                    minDistance=6, blockSize=7)
+                if extra is not None:
+                    extra = extra + np.array([[[rx1, ry1]]], dtype=np.float32)
+                    good_new = np.vstack([good_new, extra])
+
         self._pts  = good_new.reshape(-1, 1, 2)
         self.trail.append((cx, cy))
 
@@ -341,8 +512,8 @@ class VehicleSpeed:
 
         # Median downward shift of background = forward vehicle motion
         dy  = float(np.median(good_new[:, 0, 1] - good_old[:, 0, 1]))
-        raw = max(0.0, dy * ref_dist / (FOCAL_PX * dt))
-        raw = min(raw, 8.0)   # cap ~28 km/h
+        raw = max(0.0, dy * ref_dist / (FOCAL_PX * dt)) * MOTION_SCALE
+        raw = min(raw, 8.0 * MOTION_SCALE)
 
         self._hist.append(raw)
         self.veh_ms = float(np.median(self._hist))
@@ -397,8 +568,7 @@ def assess(tracker: ObjectTracker, vspd: VehicleSpeed) -> tuple:
     v_lat  = abs(tracker.lateral_ms)
     v_veh  = vspd.veh_ms
     cspd   = max(0.0, v_obj) + v_veh
-    ttc    = (d / cspd) if cspd > 0.05 else 99.0
-    ttc    = min(ttc, 99.0)
+    ttc    = tracker.ttc()   # EMA-smoothed — stable under noisy closing speed
 
     in_path = False
     if tracker.centre:
@@ -553,7 +723,9 @@ def draw_banner(disp, mode, label, detail, col, fps):
     txt(disp, label, 160, 28, 0.65, col, thick=2)
     if detail:
         txt(disp, detail, 8, 42, 0.32, (160, 170, 185))
-    txt(disp, f"FPS:{fps:.0f}", CAM_W - 65, 14, 0.30, (80, 88, 100))
+    src_col = (0, 255, 120) if DISTANCE_SOURCE == "ultrasonic" else (80, 88, 100)
+    txt(disp, f"FPS:{fps:.0f}  {DISTANCE_SOURCE.upper()}  x{MOTION_SCALE:.0f}",
+        CAM_W - 170, 14, 0.28, src_col)
 
 
 def draw_hud(disp, tracker: ObjectTracker, vspd: VehicleSpeed,
@@ -610,9 +782,7 @@ def draw_hud(disp, tracker: ObjectTracker, vspd: VehicleSpeed,
     txt(disp, "km/h cam",       RX, PT+48, 0.26, (55, 62, 75))
 
     gx = RX+52; gy = PT+108; gr = 38
-    cspd = max(0.0, tracker.speed_f) + vspd.veh_ms
-    ttcv = (tracker.dist_f / cspd) if (tracker.dist_f and cspd > 0.05) else 99.0
-    ttcv = min(ttcv, 99.0)
+    ttcv = tracker.ttc()   # EMA-smoothed, same value assess() uses
     gc   = (0,40,220) if ttcv<2 else (0,130,255) if ttcv<4 else \
            (0,220,255) if ttcv<6 else (50,220,50)
     cv2.ellipse(disp, sp((gx, gy)), (s(gr), s(gr)), 0, 200, 340, (38,42,52), s(4))
@@ -641,6 +811,7 @@ class CalibUI:
         self.real_width = 0.5
         self.calib_dist = 2.0
         self.label = "animal"
+        self.sensor_dist: float | None = None   # live reading from sensor/emulator
 
     def on_mouse(self, ev, x, y, flags, param):
         x = max(0, min(CAM_W-1, x)); y = max(44, min(CAM_H-1, y))
@@ -677,11 +848,28 @@ class CalibUI:
         cv2.line(disp, sp((rx+ruler_px, ry-5)), sp((rx+ruler_px, ry+5)), (0,200,200), s(2))
         txt(disp, f"<-- 1m at {self.calib_dist:.1f}m -->", rx, ry-7, 0.34, (0,200,200))
 
+        # Sensor / emulator distance badge
+        src = DISTANCE_SOURCE
+        if src != "vision" and self.sensor_dist is not None:
+            badge = f"  {src.upper()}: {self.sensor_dist:.3f} m  "
+            bx, by = CAM_W - 160, CAM_H - 90
+            (bw, _), _ = cv2.getTextSize(badge, _FONT, 0.42 * DS, max(1, int(DS)))
+            cv2.rectangle(disp, (s(bx)-4, s(by)-s(14)),
+                          (s(bx) + bw + 4, s(by) + 4), (0, 60, 0), -1)
+            txt(disp, badge, bx, by, 0.42, (0, 255, 120), thick=2)
+        elif src != "vision":
+            badge_col = (0, 180, 255) if src == "emulator" else (0, 80, 220)
+            txt(disp, f"  {src.upper()}: ---  ", CAM_W - 160, CAM_H - 90,
+                0.38, badge_col)
+
         # Instructions
+        dist_hint = ("sensor" if src == "ultrasonic" else
+                     "slider" if src == "emulator" else
+                     f"D/d keys: {self.calib_dist:.1f}m")
         lines = [
             "DRAG box around animal",
-            f"W/w = real width: {self.real_width:.2f}m    D/d = distance: {self.calib_dist:.1f}m    [{self.label}]  L=cycle",
-            "TIP: use ruler above to confirm distance before pressing S to SAVE",
+            f"W/w = real width: {self.real_width:.2f}m    dist: {self.calib_dist:.2f}m [{dist_hint}]    [{self.label}]  L=cycle",
+            "TIP: use ruler above to confirm distance  |  U = cycle distance source",
         ]
         for i, ln in enumerate(lines):
             c = (0,220,255) if i==0 else (160,170,185) if i==1 else (90,100,115)
@@ -695,7 +883,7 @@ WIN = "Animal Pre-Collision Tracker"
 
 
 def main():
-    global DS
+    global DS, DISTANCE_SOURCE
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
@@ -703,10 +891,11 @@ def main():
     if not cap.isOpened():
         print("[ERROR] No camera found"); return
 
-    profile = TrackerProfile()
-    tracker = ObjectTracker(profile)
-    vspd    = VehicleSpeed()
-    calib   = CalibUI()
+    profile    = TrackerProfile()
+    tracker    = ObjectTracker(profile)
+    vspd       = VehicleSpeed()
+    calib      = CalibUI()
+    ultrasonic = UltrasonicSensor(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN)
 
     PH    = 160
     WIN_H = CAM_H + PH
@@ -736,7 +925,39 @@ def main():
 
     cv2.setMouseCallback(WIN, on_mouse)
     print("[INFO] TAB=mode  S=save  R=re-acquire  Q=quit")
-    print("[INFO] W/w=width  D/d=distance  L=label")
+    print("[INFO] W/w=width  D/d=distance  L=label  U=dist-source")
+    print(f"[DIST] source = {DISTANCE_SOURCE}")
+
+    # ── Emulator trackbar window ───────────────────────────────────────────────
+    # Range: 20..1000 → 0.20 m .. 10.00 m  (divide by 100 to get metres)
+    _EMULATOR_SCALE = 100   # trackbar units per metre
+    _EMULATOR_MIN_CM = 20   # 0.20 m
+    _EMULATOR_MAX_CM = 1000 # 10.00 m
+    _emulator_open   = False
+
+    def _open_emulator():
+        nonlocal _emulator_open
+        if _emulator_open: return
+        cv2.namedWindow(EMULATOR_WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(EMULATOR_WIN, 420, 80)
+        init_cm = max(_EMULATOR_MIN_CM,
+                      min(_EMULATOR_MAX_CM, int(calib.calib_dist * _EMULATOR_SCALE)))
+        cv2.createTrackbar("Distance_cm", EMULATOR_WIN,
+                           init_cm, _EMULATOR_MAX_CM, lambda _: None)
+        _emulator_open = True
+        print("[EMULATOR] Trackbar window opened")
+
+    def _close_emulator():
+        nonlocal _emulator_open
+        if not _emulator_open: return
+        try:
+            cv2.destroyWindow(EMULATOR_WIN)
+        except Exception:
+            pass
+        _emulator_open = False
+
+    if DISTANCE_SOURCE == "emulator":
+        _open_emulator()
 
     fps_t = time.time(); fcnt = 0
     re_search_n = 30
@@ -780,6 +1001,39 @@ def main():
             calib.label = opts[(idx+1) % len(opts)]
             print(f"[LABEL] -> {calib.label}")
 
+        elif key == ord("u") or key == ord("U"):
+            # Simple toggle: vision <-> ultrasonic  (emulator stays as config default)
+            if DISTANCE_SOURCE == "ultrasonic":
+                DISTANCE_SOURCE = "vision"
+                _close_emulator()
+            else:
+                DISTANCE_SOURCE = "ultrasonic"
+                _close_emulator()
+            calib.sensor_dist = None
+            print(f"[DIST] source -> {DISTANCE_SOURCE}")
+
+        # ── Read distance source every frame ──────────────────────────────────
+        if DISTANCE_SOURCE == "ultrasonic":
+            us_reading = ultrasonic.read()   # metres (raw, pre-scale)
+            if us_reading is not None:
+                us_scaled = us_reading * MOTION_SCALE
+                if mode == "CALIBRATE":
+                    calib.calib_dist  = us_scaled
+                    calib.sensor_dist = us_scaled
+                elif mode == "TRACK" and tracker.active:
+                    # Ground-truth distance — overrides noisy pixel estimate
+                    tracker.inject_distance(us_scaled)
+        elif DISTANCE_SOURCE == "emulator":
+            if _emulator_open:
+                raw = cv2.getTrackbarPos("Distance_cm", EMULATOR_WIN)
+                d   = max(0.20, raw / _EMULATOR_SCALE) * MOTION_SCALE
+                if mode == "CALIBRATE":
+                    calib.calib_dist  = round(d, 2)
+                    calib.sensor_dist = calib.calib_dist
+
+        if mode != "CALIBRATE":
+            calib.sensor_dist = None   # hide badge outside calibration
+
         # Auto-acquire / periodic re-search
         if mode == "TRACK" and profile.is_ready:
             if not tracker.active and not auto_tried:
@@ -817,6 +1071,8 @@ def main():
         cv2.imshow(WIN, disp)
 
     cap.release()
+    _close_emulator()
+    ultrasonic.cleanup()
     cv2.destroyAllWindows()
     print("[DONE]")
 
